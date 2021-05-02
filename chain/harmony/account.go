@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/harmony-one/harmony/core/types"
 	common2 "github.com/harmony-one/harmony/rpc/common"
@@ -17,84 +18,106 @@ import (
 
 const (
 	DefaultShardID = 1
-	DefaultHost    = "https://rpc.s0.t.hmny.io"
+	DefaultHost    = "http://127.0.0.1:9598"
 )
 
-type TxBuilderOptions struct {
-	ChainID *big.Int
-}
-
 type TxBuilder struct {
-	client  *Client
 	chainID *big.Int
 }
 
-func NewTxBuilder(options TxBuilderOptions, client *Client) account.TxBuilder {
-	return TxBuilder{
-		client:  client,
-		chainID: options.ChainID,
+func NewTxBuilder(chainId *big.Int) account.TxBuilder {
+	return &TxBuilder{
+		chainID: chainId,
 	}
 }
 
-func (txBuilder TxBuilder) BuildTx(ctx context.Context, from, to address.Address, value, nonce, gasLimit, gasPrice, gasCap pack.U256, payload pack.Bytes) (account.Tx, error) {
-	chainId, err := txBuilder.client.ChainId(ctx)
+func (txBuilder *TxBuilder) BuildTx(ctx context.Context, from, to address.Address, value, nonce, gasLimit, gasPrice, gasCap pack.U256, payload pack.Bytes) (account.Tx, error) {
+	toAddr, err := NewEncoderDecoder().DecodeAddress(to)
 	if err != nil {
-		return nil, fmt.Errorf("unable to fetch Chain ID: %v", err)
+		return nil, err
 	}
 	tx := types.NewTransaction(
 		nonce.Int().Uint64(),
-		common.HexToAddress(string(to)),
+		common.BytesToAddress(toAddr),
 		DefaultShardID,
 		value.Int(),
 		gasLimit.Int().Uint64(),
 		gasPrice.Int(),
 		payload)
-	return Tx{
+	return &Tx{
 		harmonyTx: *tx,
-		chainId:   chainId,
+		chainId:   txBuilder.chainID,
+		sender:    from,
 		signed:    false,
 	}, nil
+}
+
+type TxData struct {
+	Blockhash        string   `json:"blockHash"`
+	Blocknumber      uint64   `json:"blockNumber"`
+	From             string   `json:"from"`
+	Gas              uint64   `json:"gas"`
+	Gasprice         *big.Int `json:"gasPrice"`
+	Hash             string   `json:"hash"`
+	Input            string   `json:"input"`
+	Nonce            uint64   `json:"nonce"`
+	R                string   `json:"r"`
+	S                string   `json:"s"`
+	Shardid          uint32   `json:"shardID"`
+	Timestamp        uint64   `json:"timestamp"`
+	To               string   `json:"to"`
+	Toshardid        uint32   `json:"toShardID"`
+	Transactionindex uint64   `json:"transactionIndex"`
+	V                string   `json:"v"`
+	Value            *big.Int `json:"value"`
 }
 
 type Tx struct {
 	harmonyTx types.Transaction
 	chainId   *big.Int
+	sender    address.Address
 	signed    bool
 }
 
-func (tx Tx) Hash() pack.Bytes {
+func (tx *Tx) Hash() pack.Bytes {
 	return pack.NewBytes(tx.harmonyTx.Hash().Bytes())
 }
 
-func (tx Tx) From() address.Address {
+func (tx *Tx) From() address.Address {
 	from, err := tx.harmonyTx.SenderAddress()
 	if err == nil {
-		return address.Address(from.String())
+		addr, err := NewEncoderDecoder().EncodeAddress(from.Bytes())
+		if err == nil {
+			return addr
+		}
 	}
-	return ""
+	return tx.sender
 }
 
-func (tx Tx) To() address.Address {
+func (tx *Tx) To() address.Address {
 	to := tx.harmonyTx.To()
 	if to != nil {
-		return address.Address(to.String())
+		addr, err := NewEncoderDecoder().EncodeAddress(to.Bytes())
+		if err == nil {
+			return addr
+		}
 	}
 	return ""
 }
 
-func (tx Tx) Value() pack.U256 {
+func (tx *Tx) Value() pack.U256 {
 	return pack.NewU256FromInt(tx.harmonyTx.Value())
 }
 
-func (tx Tx) Nonce() pack.U256 {
+func (tx *Tx) Nonce() pack.U256 {
 	return pack.NewU256FromU64(pack.NewU64(tx.harmonyTx.Nonce()))
 }
 
-func (tx Tx) Payload() contract.CallData {
+func (tx *Tx) Payload() contract.CallData {
 	return tx.harmonyTx.Data()
 }
 
-func (tx Tx) Sighashes() ([]pack.Bytes32, error) {
+func (tx *Tx) Sighashes() ([]pack.Bytes32, error) {
 	const digestLength = 32
 	var (
 		digestHash [32]byte
@@ -109,7 +132,7 @@ func (tx Tx) Sighashes() ([]pack.Bytes32, error) {
 	return sighashes, nil
 }
 
-func (tx Tx) Sign(signatures []pack.Bytes65, pubKey pack.Bytes) error {
+func (tx *Tx) Sign(signatures []pack.Bytes65, pubKey pack.Bytes) error {
 	if len(signatures) != 1 {
 		return fmt.Errorf("expected 1 signature, got %v signatures", len(signatures))
 	}
@@ -122,8 +145,8 @@ func (tx Tx) Sign(signatures []pack.Bytes65, pubKey pack.Bytes) error {
 	return nil
 }
 
-func (tx Tx) Serialize() (pack.Bytes, error) {
-	serializedTx, err := rlp.EncodeToBytes(tx.harmonyTx)
+func (tx *Tx) Serialize() (pack.Bytes, error) {
+	serializedTx, err := rlp.EncodeToBytes(&tx.harmonyTx)
 	if err != nil {
 		return pack.Bytes{}, err
 	}
@@ -143,100 +166,169 @@ func (opts ClientOptions) WithHost(host string) ClientOptions {
 	return opts
 }
 
-func (opts ClientOptions) WithDefaultHost() ClientOptions {
-	opts.Host = DefaultHost
-	return opts
+func DefaultClientOptions() ClientOptions {
+	return ClientOptions{
+		Host: DefaultHost,
+	}
 }
 
-func (c Client) LatestBlock(context.Context) (pack.U64, error) {
-	const method = "hmyv2_blockNumber"
-	response, err := SendData(method, []byte{}, c.opts.Host)
-	if err != nil {
-		fmt.Println(err)
-		return pack.NewU64(0), err
-	}
-	var latestBlock pack.U64
-	if err := json.Unmarshal(*response.Result, &latestBlock); err != nil {
-		return pack.NewU64(0), fmt.Errorf("decoding result: %v", err)
-	}
-	return latestBlock, nil
+func NewClient(opts ClientOptions) *Client {
+	return &Client{opts: opts}
 }
 
-func (c Client) AccountBalance(ctx context.Context, addr address.Address) (pack.U256, error) {
-	accAddress := common.HexToAddress(string(addr))
-	data := []byte(fmt.Sprintf("[\"%s\"]", accAddress))
-	const method = "hmyv2_getBalance"
-	response, err := SendData(method, data, c.opts.Host)
-	if err != nil {
-		fmt.Println(err)
-		return pack.U256{}, err
+func (c *Client) LatestBlock(ctx context.Context) (pack.U64, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return pack.NewU64(0), ctx.Err()
+		default:
+		}
+		const method = "hmyv2_blockNumber"
+		response, err := SendData(method, []byte{}, c.opts.Host)
+		if err != nil {
+			fmt.Println(err)
+			return pack.NewU64(0), err
+		}
+		var latestBlock uint64
+		if err := json.Unmarshal(*response.Result, &latestBlock); err != nil {
+			return pack.NewU64(0), fmt.Errorf("decoding result: %v", err)
+		}
+		return pack.NewU64(latestBlock), nil
 	}
-	var balance pack.U256
-	if err := json.Unmarshal(*response.Result, &balance); err != nil {
-		return pack.U256{}, fmt.Errorf("decoding result: %v", err)
-	}
-	return balance, nil
 }
 
-func (c Client) AccountNonce(ctx context.Context, addr address.Address) (pack.U256, error) {
-	accAddress := common.HexToAddress(string(addr))
-	data := []byte(fmt.Sprintf("[\"%s\", \"%s\"]", accAddress, "SENT"))
-	const method = "hmyv2_getTransactionsCount"
-	response, err := SendData(method, data, c.opts.Host)
-	if err != nil {
-		fmt.Println(err)
-		return pack.U256{}, err
+func (c *Client) AccountBalance(ctx context.Context, addr address.Address) (pack.U256, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return pack.U256{}, ctx.Err()
+		default:
+		}
+		data := []byte(fmt.Sprintf("[\"%s\"]", addr))
+		const method = "hmyv2_getBalance"
+		response, err := SendData(method, data, c.opts.Host)
+		if err != nil {
+			fmt.Println(err)
+			return pack.U256{}, err
+		}
+		var balance uint64
+		if err := json.Unmarshal(*response.Result, &balance); err != nil {
+			return pack.U256{}, fmt.Errorf("decoding result: %v", err)
+		}
+		return pack.NewU256FromU64(pack.NewU64(balance)), nil
 	}
-	var nonce pack.U256
-	if err := json.Unmarshal(*response.Result, &nonce); err != nil {
-		return pack.U256{}, fmt.Errorf("decoding result: %v", err)
-	}
-	return nonce, nil
 }
 
-func (c Client) Tx(ctx context.Context, hash pack.Bytes) (account.Tx, pack.U64, error) {
-	data := []byte(fmt.Sprintf("[\"%s\"]", string(hash)))
-	const method = "hmyv2_getTransactionByHash"
-	response, err := SendData(method, data, c.opts.Host)
-	if err != nil {
-		fmt.Println(err)
-		return nil, pack.NewU64(0), err
+func (c *Client) AccountNonce(ctx context.Context, addr address.Address) (pack.U256, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return pack.U256{}, ctx.Err()
+		default:
+		}
+		data := []byte(fmt.Sprintf("[\"%s\", \"%s\"]", addr, "SENT"))
+		const method = "hmyv2_getTransactionsCount"
+		response, err := SendData(method, data, c.opts.Host)
+		if err != nil {
+			fmt.Println(err)
+			return pack.U256{}, err
+		}
+		var nonce uint64
+		if err := json.Unmarshal(*response.Result, &nonce); err != nil {
+			return pack.U256{}, fmt.Errorf("decoding result: %v", err)
+		}
+		return pack.NewU256FromU64(pack.NewU64(nonce)), nil
 	}
-	var harmonyTx types.Transaction
-	if err := json.Unmarshal(*response.Result, &harmonyTx); err != nil {
-		return nil, pack.NewU64(0), fmt.Errorf("decoding result: %v", err)
-	}
-	tx := Tx{
-		harmonyTx: harmonyTx,
-	}
-	return &tx, pack.NewU64(0), nil
 }
 
-func (c Client) SubmitTx(ctx context.Context, tx account.Tx) error {
-	data := []byte(fmt.Sprintf("[\"%s\"]", string(tx.Hash())))
-	const method = "hmyv2_sendRawTransaction"
-	response, err := SendData(method, data, c.opts.Host)
-	if err != nil {
-		fmt.Println(err)
-		return err
+func (c *Client) Tx(ctx context.Context, hash pack.Bytes) (account.Tx, pack.U64, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, pack.NewU64(0), ctx.Err()
+		default:
+		}
+		data := []byte(fmt.Sprintf("[\"%s\"]", hexutil.Encode(hash)))
+		const method = "hmyv2_getTransactionByHash"
+		response, err := SendData(method, data, c.opts.Host)
+		if err != nil {
+			return nil, pack.NewU64(0), err
+		}
+		var txData TxData
+		if response.Result == nil {
+			return nil, pack.NewU64(0), fmt.Errorf("decoding result: %v", err)
+		}
+		if err := json.Unmarshal(*response.Result, &txData); err != nil {
+			return nil, pack.NewU64(0), fmt.Errorf("decoding result: %v", err)
+		}
+
+		tx, err := buildTxFromTxData(txData)
+		return tx, pack.NewU64(1), err
 	}
-	var nonce pack.U256
-	if err := json.Unmarshal(*response.Result, &nonce); err != nil {
-		return fmt.Errorf("decoding result: %v", err)
-	}
-	return nil
 }
 
-func (c Client) ChainId(ctx context.Context) (*big.Int, error) {
-	const method = "hmyv2_getNodeMetadata"
-	response, err := SendData(method, []byte{}, c.opts.Host)
+func (c *Client) SubmitTx(ctx context.Context, tx account.Tx) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		txSerilized, err := tx.Serialize()
+		if err != nil {
+			return err
+		}
+		hexSignature := hexutil.Encode(txSerilized)
+		data := []byte(fmt.Sprintf("[\"%s\"]", hexSignature))
+		const method = "hmyv2_sendRawTransaction"
+		tx1 := new(types.Transaction)
+		err = rlp.DecodeBytes(txSerilized, tx1)
+		_, err = SendData(method, data, c.opts.Host)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
+func (c *Client) ChainId(ctx context.Context) (*big.Int, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return big.NewInt(0), ctx.Err()
+		default:
+		}
+		const method = "hmyv2_getNodeMetadata"
+		response, err := SendData(method, []byte{}, c.opts.Host)
+		if err != nil {
+			fmt.Println(err)
+			return big.NewInt(0), err
+		}
+		var nodeMetadata common2.NodeMetadata
+		if err := json.Unmarshal(*response.Result, &nodeMetadata); err != nil {
+			return big.NewInt(0), fmt.Errorf("decoding result: %v", err)
+		}
+		return nodeMetadata.ChainConfig.ChainID, nil
+	}
+}
+
+func buildTxFromTxData(data TxData) (account.Tx, error) {
+	toAddr, err := NewEncoderDecoder().DecodeAddress(address.Address(data.To))
 	if err != nil {
-		fmt.Println(err)
-		return big.NewInt(0), err
+		return nil, err
 	}
-	var nodeMetadata common2.NodeMetadata
-	if err := json.Unmarshal(*response.Result, &nodeMetadata); err != nil {
-		return big.NewInt(0), fmt.Errorf("decoding result: %v", err)
-	}
-	return nodeMetadata.ChainConfig.ChainID, nil
+	tx := types.NewTransaction(
+		data.Nonce,
+		common.BytesToAddress(toAddr),
+		data.Shardid,
+		data.Value,
+		data.Gas,
+		data.Gasprice,
+		pack.Bytes(nil),
+	)
+	return &Tx{
+		harmonyTx: *tx,
+		sender:    address.Address(data.From),
+		signed:    true,
+	}, nil
 }
